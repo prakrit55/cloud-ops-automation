@@ -1,0 +1,7 @@
+[project]
+name = "idle-checker"
+version = "0.1.0"
+dependencies = ["boto3", "rich"]
+
+[project.scripts]
+idle-checker = "idle_checker:main"

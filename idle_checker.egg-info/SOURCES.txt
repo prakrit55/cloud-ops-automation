@@ -1,0 +1,9 @@
+pyproject.toml
+idle_checker/__init__.py
+idle_checker/cli.py
+idle_checker.egg-info/PKG-INFO
+idle_checker.egg-info/SOURCES.txt
+idle_checker.egg-info/dependency_links.txt
+idle_checker.egg-info/entry_points.txt
+idle_checker.egg-info/requires.txt
+idle_checker.egg-info/top_level.txt

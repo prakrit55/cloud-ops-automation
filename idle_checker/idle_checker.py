@@ -45,8 +45,6 @@ try:
 except ImportError:
     HAS_RICH = False
 
-# ─────────────────────────── logging ──────────────────────────────────── #
-
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
@@ -54,9 +52,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("aws-idle-scanner")
 
-# ─────────────────────────── data model ───────────────────────────────── #
-
-ALL_SERVICES = ("ec2", "lambda", "s3", "rds", "eks", "cloudfront", "ecr")
+ALL_SERVICES = ("ec2", "lambda", "s3", "rds", "eks", "cloudfront", "ecs", "ecr", "ebs", "network")
 
 
 @dataclass
@@ -167,6 +163,124 @@ def scan_ec2(region: str, days: int) -> list[IdleResource]:
 
     return idle
 
+def scan_ebs(region: str, days: int) -> list[IdleResource]:
+    ec2 = boto3.client("ec2", region_name=region)
+    cw = boto3.client("cloudwatch", region_name=region)
+
+    idle = []
+    threshold = cutoff(days)
+
+    # ================= VOLUMES ================= #
+    volumes = _paginate(ec2, "describe_volumes", "Volumes")
+
+    for vol in volumes:
+        vol_id = vol["VolumeId"]
+        state = vol["State"]
+        size = vol.get("Size", 0)
+        create_time = vol.get("CreateTime")
+        attachments = vol.get("Attachments", [])
+
+        # 🔹 1. Unattached (STRONG SIGNAL)
+        if state == "available":
+            idle.append(
+                IdleResource(
+                    service="ebs",
+                    resource_id=vol_id,
+                    region=region,
+                    reason="Unattached (orphan) volume",
+                    extra={
+                        "size_gb": size,
+                        "created": create_time.isoformat()
+                    },
+                )
+            )
+            continue
+
+        active_read = has_metrics(
+            cw,
+            "AWS/EBS",
+            "VolumeReadOps",
+            [{"Name": "VolumeId", "Value": vol_id}],
+            days,
+        )
+
+        active_write = has_metrics(
+            cw,
+            "AWS/EBS",
+            "VolumeWriteOps",
+            [{"Name": "VolumeId", "Value": vol_id}],
+            days,
+        )
+
+        if not active_read and not active_write:
+            idle.append(
+                IdleResource(
+                    service="ebs",
+                    resource_id=vol_id,
+                    region=region,
+                    reason=f"No read/write activity in last {days} days",
+                    extra={
+                        "size_gb": size,
+                        "attached_to": attachments[0]["InstanceId"] if attachments else "unknown",
+                    },
+                )
+            )
+
+        if create_time and create_time < threshold:
+            idle.append(
+                IdleResource(
+                    service="ebs",
+                    resource_id=vol_id,
+                    region=region,
+                    reason=f"Old volume (> {days} days)",
+                    extra={"size_gb": size},
+                )
+            )
+
+    # ================= SNAPSHOTS ================= #
+    snapshots = _paginate(
+        ec2,
+        "describe_snapshots",
+        "Snapshots",
+        OwnerIds=["self"]
+    )
+
+    for snap in snapshots:
+        snap_id = snap["SnapshotId"]
+        start_time = snap["StartTime"]
+        vol_id = snap.get("VolumeId")
+        size = snap.get("VolumeSize", 0)
+
+        # 🔹 4. Old snapshot
+        if start_time < threshold:
+            idle.append(
+                IdleResource(
+                    service="ebs",
+                    resource_id=snap_id,
+                    region=region,
+                    reason=f"Snapshot older than {days} days",
+                    extra={
+                        "volume_id": vol_id,
+                        "size_gb": size,
+                    },
+                )
+            )
+
+        # 🔹 5. Orphan snapshot (volume deleted)
+        try:
+            ec2.describe_volumes(VolumeIds=[vol_id])
+        except ClientError:
+            idle.append(
+                IdleResource(
+                    service="ebs",
+                    resource_id=snap_id,
+                    region=region,
+                    reason="Snapshot of deleted volume",
+                    extra={"volume_id": vol_id},
+                )
+            )
+
+    return idle
 
 def scan_lambda(region: str, days: int) -> list[IdleResource]:
     client = boto3.client("lambda", region_name=region)
@@ -460,6 +574,235 @@ def scan_cloudfront(region: str, days: int) -> list[IdleResource]:  # region unu
 
     return idle
 
+def scan_network(region: str, days: int) -> list[IdleResource]:
+    ec2 = boto3.client("ec2", region_name=region)
+    elbv2 = boto3.client("elbv2", region_name=region)
+    elb = boto3.client("elb", region_name=region)  # classic
+    cw = boto3.client("cloudwatch", region_name=region)
+
+    idle = []
+
+    # ================= EIP ================= #
+    addresses = ec2.describe_addresses()["Addresses"]
+
+    for addr in addresses:
+        public_ip = addr.get("PublicIp")
+
+        if not addr.get("InstanceId") and not addr.get("NetworkInterfaceId"):
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=public_ip,
+                    region=region,
+                    reason="Unassociated Elastic IP",
+                )
+            )
+
+    # ================= ALB / NLB ================= #
+    try:
+        lbs = elbv2.describe_load_balancers()["LoadBalancers"]
+    except Exception:
+        lbs = []
+
+    for lb in lbs:
+        lb_arn = lb["LoadBalancerArn"]
+        lb_name = lb["LoadBalancerName"]
+
+        target_groups = elbv2.describe_target_groups(
+            LoadBalancerArn=lb_arn
+        )["TargetGroups"]
+
+        total_targets = 0
+        unhealthy_targets = 0
+
+        for tg in target_groups:
+            tg_arn = tg["TargetGroupArn"]
+
+            health = elbv2.describe_target_health(TargetGroupArn=tg_arn)
+            targets = health["TargetHealthDescriptions"]
+
+            total_targets += len(targets)
+            unhealthy_targets += sum(
+                1 for t in targets if t["TargetHealth"]["State"] != "healthy"
+            )
+
+        # 🔹 No targets
+        if total_targets == 0:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=lb_name,
+                    region=region,
+                    reason="Load balancer has no registered targets",
+                )
+            )
+            continue
+
+        # 🔹 All unhealthy
+        if total_targets == unhealthy_targets:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=lb_name,
+                    region=region,
+                    reason="All targets are unhealthy",
+                )
+            )
+
+        # 🔹 No traffic
+        active = has_metrics(
+            cw,
+            "AWS/ApplicationELB",
+            "RequestCount",
+            [{"Name": "LoadBalancer", "Value": lb_arn.split("/")[-1]}],
+            days,
+        )
+
+        if not active:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=lb_name,
+                    region=region,
+                    reason=f"No traffic in last {days} days",
+                )
+            )
+
+    # ================= CLASSIC ELB ================= #
+    try:
+        classic_lbs = elb.describe_load_balancers()["LoadBalancerDescriptions"]
+    except Exception:
+        classic_lbs = []
+
+    for lb in classic_lbs:
+        name = lb["LoadBalancerName"]
+        instances = lb.get("Instances", [])
+
+        if not instances:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=name,
+                    region=region,
+                    reason="Classic ELB has no instances",
+                )
+            )
+
+    # ================= NAT GATEWAY ================= #
+    nat_gws = ec2.describe_nat_gateways()["NatGateways"]
+
+    for nat in nat_gws:
+        nat_id = nat["NatGatewayId"]
+
+        active = has_metrics(
+            cw,
+            "AWS/NATGateway",
+            "BytesOutToDestination",
+            [{"Name": "NatGatewayId", "Value": nat_id}],
+            days,
+        )
+
+        if not active:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=nat_id,
+                    region=region,
+                    reason=f"No traffic through NAT Gateway in last {days} days",
+                )
+            )
+
+    return idle
+
+def scan_ecs(region: str, days: int) -> list[IdleResource]:
+    ecs = boto3.client("ecs", region_name=region)
+    cw = boto3.client("cloudwatch", region_name=region)
+
+    idle = []
+
+    clusters = ecs.list_clusters()["clusterArns"]
+
+    for cluster_arn in clusters:
+        cluster_name = cluster_arn.split("/")[-1]
+
+        services = ecs.list_services(cluster=cluster_arn)["serviceArns"]
+        tasks = ecs.list_tasks(cluster=cluster_arn)["taskArns"]
+
+        # 🔹 1. Empty cluster
+        if not services and not tasks:
+            idle.append(
+                IdleResource(
+                    service="ecs",
+                    resource_id=cluster_name,
+                    region=region,
+                    reason="Cluster has no services or running tasks",
+                )
+            )
+            continue
+
+        # 🔹 2. Check services
+        if services:
+            svc_details = ecs.describe_services(
+                cluster=cluster_arn,
+                services=services
+            )["services"]
+
+            for svc in svc_details:
+                svc_name = svc["serviceName"]
+                desired = svc.get("desiredCount", 0)
+                running = svc.get("runningCount", 0)
+
+                # 🔸 desired = 0 → likely unused
+                if desired == 0:
+                    idle.append(
+                        IdleResource(
+                            service="ecs",
+                            resource_id=svc_name,
+                            region=region,
+                            reason="Service desired count is 0",
+                            extra={"cluster": cluster_name},
+                        )
+                    )
+                    continue
+
+                # 🔸 running but no traffic (via ALB)
+                if "loadBalancers" in svc and svc["loadBalancers"]:
+                    lb = svc["loadBalancers"][0]
+                    target_group_arn = lb.get("targetGroupArn")
+
+                    active = has_metrics(
+                        cw,
+                        "AWS/ApplicationELB",
+                        "RequestCount",
+                        [{"Name": "TargetGroup", "Value": target_group_arn.split(":")[-1]}],
+                        days,
+                    )
+
+                    if not active:
+                        idle.append(
+                            IdleResource(
+                                service="ecs",
+                                resource_id=svc_name,
+                                region=region,
+                                reason=f"No traffic to service in last {days} days",
+                                extra={"cluster": cluster_name},
+                            )
+                        )
+        stopped_tasks = ecs.list_tasks(
+            cluster=cluster_arn,
+            desiredStatus="STOPPED"
+        )["taskArns"]
+        if len(stopped_tasks) > 50:  # heuristic
+            idle.append(
+                IdleResource(
+                    service="ecs",
+                    resource_id=cluster_name,
+                    region=region,
+                    reason="Large number of stopped tasks (cleanup recommended)",
+                    extra={"stopped_tasks": len(stopped_tasks)},
+                )
+            )
+    return idle
 
 def scan_ecr(region: str, days: int) -> list[IdleResource]:
     """
@@ -533,7 +876,6 @@ def scan_ecr(region: str, days: int) -> list[IdleResource]:
 
     return idle
 
-
 # ─────────────────────────── runner ───────────────────────────────────── #
 
 SCANNER_MAP: dict[str, Callable[..., list[IdleResource]]] = {
@@ -543,9 +885,11 @@ SCANNER_MAP: dict[str, Callable[..., list[IdleResource]]] = {
     "rds": scan_rds,
     "eks": scan_eks,
     "cloudfront": scan_cloudfront,
+    "ecs": scan_ecs,
     "ecr": scan_ecr,
+    "ebs": scan_ebs,
+    "network": scan_network
 }
-
 
 def run_scans(
     services: list[str],
@@ -571,7 +915,6 @@ def run_scans(
 
     return results
 
-
 # ─────────────────────────── output formatters ────────────────────────── #
 
 def fmt_text(results: dict[str, list[IdleResource]]) -> str:
@@ -592,7 +935,6 @@ def fmt_text(results: dict[str, list[IdleResource]]) -> str:
     lines += ["", "=" * 55, f"  Total idle resources: {total}", "=" * 55, ""]
     return "\n".join(lines)
 
-
 def fmt_json(results: dict[str, list[IdleResource]]) -> str:
     payload = {
         "generated_at": utc_now().isoformat(),
@@ -601,7 +943,6 @@ def fmt_json(results: dict[str, list[IdleResource]]) -> str:
         "total_idle": sum(len(v) for v in results.values()),
     }
     return json.dumps(payload, indent=2, default=str)
-
 
 def fmt_csv(results: dict[str, list[IdleResource]]) -> str:
     all_resources = [r for items in results.values() for r in items]
@@ -638,7 +979,10 @@ SERVICE_ICONS = {
     "rds":         "🗄 ",
     "eks":         "☸ ",
     "cloudfront":  "🌐",
+    "ecs":         "🐳",
     "ecr":         "📦",
+    "ebs":         "💽",
+    "network":     "🔌",
 }
 
 SERVICE_COLORS = {
@@ -649,8 +993,10 @@ SERVICE_COLORS = {
     "eks":        "magenta",
     "cloudfront": "bright_white",
     "ecr":        "orange3",
+    "ebs":        "cyan",
+    "network":    "bright_magenta",
+    "ecs":        "bright_blue"
 }
-
 # ─────────────────────────── rich table output ────────────────────────── #
 
 def fmt_table(results: dict[str, list[IdleResource]]) -> str:

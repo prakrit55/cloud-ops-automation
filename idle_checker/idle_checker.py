@@ -315,7 +315,6 @@ def scan_lambda(region: str, days: int) -> list[IdleResource]:
 
     return idle
 
-
 def scan_s3(region: str, days: int) -> list[IdleResource]:
     """
     Uses CloudWatch Storage Lens / S3 request metrics where available,
@@ -388,7 +387,6 @@ def scan_s3(region: str, days: int) -> list[IdleResource]:
                 )
 
     return idle
-
 
 def scan_rds(region: str, days: int) -> list[IdleResource]:
     rds = boto3.client("rds", region_name=region)
@@ -577,22 +575,42 @@ def scan_cloudfront(region: str, days: int) -> list[IdleResource]:  # region unu
 def scan_network(region: str, days: int) -> list[IdleResource]:
     ec2 = boto3.client("ec2", region_name=region)
     elbv2 = boto3.client("elbv2", region_name=region)
-    elb = boto3.client("elb", region_name=region)  # classic
+    elb = boto3.client("elb", region_name=region)
     cw = boto3.client("cloudwatch", region_name=region)
 
-    idle = []
+    idle: list[IdleResource] = []
+
+    # ================= ENI INDEXING ================= #
+    all_enis = _paginate(ec2, "describe_network_interfaces", "NetworkInterfaces")
+
+    enis_by_vpc = {}
+    enis_by_subnet = {}
+    enis_by_sg = {}
+
+    for eni in all_enis:
+        vpc_id = eni.get("VpcId")
+        subnet_id = eni.get("SubnetId")
+
+        if vpc_id:
+            enis_by_vpc.setdefault(vpc_id, []).append(eni)
+
+        if subnet_id:
+            enis_by_subnet.setdefault(subnet_id, []).append(eni)
+
+        for sg in eni.get("Groups", []):
+            sg_id = sg.get("GroupId")
+            if sg_id:
+                enis_by_sg.setdefault(sg_id, []).append(eni)
 
     # ================= EIP ================= #
     addresses = ec2.describe_addresses()["Addresses"]
 
     for addr in addresses:
-        public_ip = addr.get("PublicIp")
-
         if not addr.get("InstanceId") and not addr.get("NetworkInterfaceId"):
             idle.append(
                 IdleResource(
                     service="network",
-                    resource_id=public_ip,
+                    resource_id=addr.get("PublicIp"),
                     region=region,
                     reason="Unassociated Elastic IP",
                 )
@@ -617,16 +635,14 @@ def scan_network(region: str, days: int) -> list[IdleResource]:
 
         for tg in target_groups:
             tg_arn = tg["TargetGroupArn"]
-
             health = elbv2.describe_target_health(TargetGroupArn=tg_arn)
-            targets = health["TargetHealthDescriptions"]
 
+            targets = health["TargetHealthDescriptions"]
             total_targets += len(targets)
             unhealthy_targets += sum(
                 1 for t in targets if t["TargetHealth"]["State"] != "healthy"
             )
 
-        # 🔹 No targets
         if total_targets == 0:
             idle.append(
                 IdleResource(
@@ -638,7 +654,6 @@ def scan_network(region: str, days: int) -> list[IdleResource]:
             )
             continue
 
-        # 🔹 All unhealthy
         if total_targets == unhealthy_targets:
             idle.append(
                 IdleResource(
@@ -649,7 +664,6 @@ def scan_network(region: str, days: int) -> list[IdleResource]:
                 )
             )
 
-        # 🔹 No traffic
         active = has_metrics(
             cw,
             "AWS/ApplicationELB",
@@ -675,16 +689,65 @@ def scan_network(region: str, days: int) -> list[IdleResource]:
         classic_lbs = []
 
     for lb in classic_lbs:
-        name = lb["LoadBalancerName"]
-        instances = lb.get("Instances", [])
-
-        if not instances:
+        if not lb.get("Instances"):
             idle.append(
                 IdleResource(
                     service="network",
-                    resource_id=name,
+                    resource_id=lb["LoadBalancerName"],
                     region=region,
                     reason="Classic ELB has no instances",
+                )
+            )
+
+    # ================= VPC ================= #
+    vpcs = ec2.describe_vpcs()["Vpcs"]
+
+    for vpc in vpcs:
+        vpc_id = vpc["VpcId"]
+
+        if vpc_id not in enis_by_vpc:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=vpc_id,
+                    region=region,
+                    reason="VPC has no active network interfaces",
+                )
+            )
+
+    # ================= SUBNET ================= #
+    subnets = ec2.describe_subnets()["Subnets"]
+
+    for subnet in subnets:
+        subnet_id = subnet["SubnetId"]
+
+        if subnet_id not in enis_by_subnet:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=subnet_id,
+                    region=region,
+                    reason="Subnet has no attached resources",
+                    extra={"vpc_id": subnet["VpcId"]},
+                )
+            )
+
+    # ================= SECURITY GROUP ================= #
+    sgs = ec2.describe_security_groups()["SecurityGroups"]
+
+    for sg in sgs:
+        sg_id = sg["GroupId"]
+
+        if sg.get("GroupName") == "default":
+            continue
+
+        if sg_id not in enis_by_sg:
+            idle.append(
+                IdleResource(
+                    service="network",
+                    resource_id=sg_id,
+                    region=region,
+                    reason="Security group not attached to any resource",
                 )
             )
 
